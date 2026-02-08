@@ -128,36 +128,43 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 			);
 		});
 
-		ClientReceiveMessageEvents.CHAT.register((message, signedMessage, sender, params, receptionTimestamp) -> {
-			if (!ggCounterEnabled) return;
+		ClientReceiveMessageEvents.GAME.register((message, isOverlay) -> {
+			// 1. If the message is in the Action Bar (overlay), IGNORE IT.
+			// This stops the infinite loop!
+			if (isOverlay || !ggCounterEnabled) return;
 
-			// 1. Strip ALL color codes and formatting (fixes the "symbols" fear)
 			String cleanContent = Formatting.strip(message.getString());
 
-			// 2. Look for GG
-			if (cleanContent.toLowerCase().contains("gg")) {
+			if (cleanContent != null && cleanContent.toLowerCase().contains("gg")) {
+				// Use the MinecraftClient instance to run logic
+				MinecraftClient client = MinecraftClient.getInstance();
+
+				// Ensure we don't count our own "GG" from the counter message
+				if (cleanContent.contains("[GG Counter]")) return;
+
 				int current = ggCount.incrementAndGet();
 
-				// 3. Handle the 10-second reset timer
+				// Handle the 10-second reset timer
 				if (resetTask != null && !resetTask.isDone()) {
-					resetTask.cancel(false); // Cancel previous timer if another GG arrived
+					resetTask.cancel(false);
 				}
 				resetTask = scheduler.schedule(() -> {
 					if (ggCount.get() > 0) {
 						ggCount.set(0);
-						MinecraftClient.getInstance().execute(() ->
-								MinecraftClient.getInstance().player.sendMessage(Text.of("§8[Bot] GG count reset (10s idle)."), true)
+						client.execute(() ->
+								client.player.sendMessage(Text.of("§8[Bot] GG count reset (10s idle)."), true)
 						);
 					}
 				}, 10, TimeUnit.SECONDS);
 
-				// 4. Send GG logic
-				MinecraftClient.getInstance().player.sendMessage(Text.of("§d[GG Counter] " + current + "/" + GG_THRESHOLD), true);
+				// Send the progress to Action Bar
+				client.player.sendMessage(Text.of("§d[GG Counter] " + current + "/" + GG_THRESHOLD), true);
 
+				// Send actual GG if threshold reached
 				if (current >= GG_THRESHOLD) {
 					long currentTime = System.currentTimeMillis();
 					if (currentTime - lastGGSentTime >= GG_COOLDOWN_MS) {
-						MinecraftClient.getInstance().player.networkHandler.sendChatMessage("GG");
+						client.player.networkHandler.sendChatMessage("GG");
 						lastGGSentTime = currentTime;
 						ggCount.set(0);
 						if (resetTask != null) resetTask.cancel(false);
