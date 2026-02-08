@@ -39,7 +39,7 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 	private boolean dropEnabled = false;
 	private long lastDropTime = 0;
 	private static final long DROP_INTERVAL_MS = 215000; // 215 seconds in milliseconds
-
+	private int tickelapsed_kill = 0;
 
 	private boolean ggCounterEnabled = false;
 	private final AtomicInteger ggCount = new AtomicInteger(0);
@@ -125,7 +125,7 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 			String cleanContent = Formatting.strip(message.getString());
 
 			// 2. Look for GG
-			if (GG_STRICT_PATTERN.matcher(cleanContent).find()) {
+			if (cleanContent.toLowerCase().contains("gg")) {
 				int current = ggCount.incrementAndGet();
 
 				// 3. Handle the 10-second reset timer
@@ -305,7 +305,9 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 
 	private void checkTargetStatus(MinecraftClient client) {
 		// If target is dead or removed, scan again
-		if (currentTarget == null || !currentTarget.isAlive() || currentTarget.isRemoved()) {
+		tickelapsed_kill++;
+		if (currentTarget == null || !currentTarget.isAlive() || currentTarget.isRemoved() || tickelapsed_kill >= 6000) {
+			tickelapsed_kill = 0;
 			currentState = BotState.SCANNING;
 		}
 		// Note: If you want to attack AGAIN because it didn't die in one hit,
