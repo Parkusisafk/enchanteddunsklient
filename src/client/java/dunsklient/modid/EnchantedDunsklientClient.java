@@ -1,6 +1,9 @@
 package dunsklient.modid;
-
+import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
+import java.util.concurrent.atomic.AtomicInteger;
 import com.mojang.brigadier.arguments.StringArgumentType;
+import java.util.regex.Pattern;
+import java.util.regex.Matcher;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
@@ -16,6 +19,11 @@ import net.minecraft.util.Identifier;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.util.Formatting;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ScheduledFuture;
 
 import java.util.Comparator;
 import java.util.Optional;
@@ -28,6 +36,23 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 	private LivingEntity currentTarget = null;
 	private BotState currentState = BotState.IDLE;
 
+	private boolean dropEnabled = false;
+	private long lastDropTime = 0;
+	private static final long DROP_INTERVAL_MS = 215000; // 215 seconds in milliseconds
+
+
+	private boolean ggCounterEnabled = false;
+	private final AtomicInteger ggCount = new AtomicInteger(0);
+	private static final int GG_THRESHOLD = 10;
+	private long lastGGSentTime = 0;
+	private static final long GG_COOLDOWN_MS = 60000;
+
+	// NEW: For the 10-second reset
+	private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+	private ScheduledFuture<?> resetTask = null;
+
+	// Pattern that ONLY looks for "GG" and ignores everything else (including symbols)
+	private static final Pattern GG_STRICT_PATTERN = Pattern.compile("GG", Pattern.CASE_INSENSITIVE);
 	private enum BotState {
 		IDLE,
 		SCANNING,
@@ -58,7 +83,79 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 						return 1;
 					})
 			);
+
+			dispatcher.register(ClientCommandManager.literal("luckyblockability")
+					.executes(context -> {
+						this.dropEnabled = true;
+						this.lastDropTime = 0; //i want it to drop immediately
+						context.getSource().getClient().player.sendMessage(Text.of("§6Lucky Block Ability enabled! Dropping slot 1 every 215s."), false);
+						return 1;
+					})
+			);
+
+			dispatcher.register(ClientCommandManager.literal("ggtoggle")
+					.executes(context -> {
+						this.ggCounterEnabled = !this.ggCounterEnabled;
+						this.ggCount.set(0); // Reset count on toggle
+						String status = ggCounterEnabled ? "§aEnabled" : "§cDisabled";
+						context.getSource().getClient().player.sendMessage(Text.of("§dGG Auto-Responder: " + status), false);
+						return 1;
+					})
+			);
+
+			dispatcher.register(ClientCommandManager.literal("everything")
+					.executes(context -> {
+						this.ggCounterEnabled = !this.ggCounterEnabled;
+						this.ggCount.set(0); // Reset count on toggle
+						String status = ggCounterEnabled ? "§aEnabled" : "§cDisabled";
+						context.getSource().getClient().player.sendMessage(Text.of("§dGG Auto-Responder: " + status), false);
+						this.dropEnabled = true;
+						this.lastDropTime = 0; //i want it to drop immediately
+						context.getSource().getClient().player.sendMessage(Text.of("§6Lucky Block Ability enabled! Dropping slot 1 every 215s."), false);
+
+						return 1;
+					})
+			);
 		});
+
+		ClientReceiveMessageEvents.CHAT.register((message, signedMessage, sender, params, receptionTimestamp) -> {
+			if (!ggCounterEnabled) return;
+
+			// 1. Strip ALL color codes and formatting (fixes the "symbols" fear)
+			String cleanContent = Formatting.strip(message.getString());
+
+			// 2. Look for GG
+			if (GG_STRICT_PATTERN.matcher(cleanContent).find()) {
+				int current = ggCount.incrementAndGet();
+
+				// 3. Handle the 10-second reset timer
+				if (resetTask != null && !resetTask.isDone()) {
+					resetTask.cancel(false); // Cancel previous timer if another GG arrived
+				}
+				resetTask = scheduler.schedule(() -> {
+					if (ggCount.get() > 0) {
+						ggCount.set(0);
+						MinecraftClient.getInstance().execute(() ->
+								MinecraftClient.getInstance().player.sendMessage(Text.of("§8[Bot] GG count reset (10s idle)."), true)
+						);
+					}
+				}, 10, TimeUnit.SECONDS);
+
+				// 4. Send GG logic
+				MinecraftClient.getInstance().player.sendMessage(Text.of("§d[GG Counter] " + current + "/" + GG_THRESHOLD), true);
+
+				if (current >= GG_THRESHOLD) {
+					long currentTime = System.currentTimeMillis();
+					if (currentTime - lastGGSentTime >= GG_COOLDOWN_MS) {
+						MinecraftClient.getInstance().player.networkHandler.sendChatMessage("GG");
+						lastGGSentTime = currentTime;
+						ggCount.set(0);
+						if (resetTask != null) resetTask.cancel(false);
+					}
+				}
+			}
+		});
+
 
 		ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
 	}
@@ -67,7 +164,9 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 		this.isActive = false;
 		this.currentTarget = null;
 		this.currentState = BotState.IDLE;
-
+		this.dropEnabled = false;
+		this.ggCounterEnabled = false;
+		this.ggCount.set(0);
 		// Release the keys so you stop moving immediately
 		if (client.player != null) {
 			client.options.forwardKey.setPressed(false);
@@ -88,6 +187,18 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 	}
 
 	private void onTick(MinecraftClient client) {
+		if (dropEnabled && client.player != null) {
+			long currentTime = System.currentTimeMillis();
+			if (currentTime - lastDropTime >= DROP_INTERVAL_MS) {
+				// Drop the item in Slot 1 (index 0)
+				client.player.getInventory().selectedSlot = 0;
+				client.player.dropSelectedItem(false); // true = drops the whole stack
+
+				lastDropTime = currentTime;
+				client.player.sendMessage(Text.of("§6[LuckyBlock] Item dropped! Next drop in 215s."), true);
+			}
+		}
+
 		if (!isActive || client.player == null || client.world == null) return;
 
 		switch (currentState) {
