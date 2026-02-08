@@ -205,6 +205,9 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 						}
 					});
 				}, 5, TimeUnit.SECONDS);
+
+                stopAutoBot(client);
+
 			}
 		});
 
@@ -381,7 +384,7 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 	private void checkTargetStatus(MinecraftClient client) {
 		// If target is dead or removed, scan again
 		tickelapsed_kill++;
-		if (currentTarget == null || !currentTarget.isAlive() || currentTarget.isRemoved() || tickelapsed_kill >= 3000) {
+		if (currentTarget == null || !currentTarget.isAlive() || currentTarget.isRemoved() || tickelapsed_kill >= 1200) {
 			tickelapsed_kill = 0;
 			currentState = BotState.SCANNING;
 		}
