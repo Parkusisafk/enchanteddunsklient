@@ -72,6 +72,16 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 							.executes(context -> {
 								// Use getIdentifier instead of getString
 								Identifier id = IdentifierArgumentType.getIdentifier((com.mojang.brigadier.context.CommandContext) context, "mobtype");								startAutoBot(id, context.getSource().getClient());
+
+								this.ggCounterEnabled = !this.ggCounterEnabled;
+								this.ggCount.set(0); // Reset count on toggle
+								String status = ggCounterEnabled ? "§aEnabled" : "§cDisabled";
+								context.getSource().getClient().player.sendMessage(Text.of("§dGG Auto-Responder: " + status), false);
+								this.dropEnabled = true;
+								this.lastDropTime = 0; //i want it to drop immediately
+								context.getSource().getClient().player.sendMessage(Text.of("§6Lucky Block Ability enabled! Dropping slot 1 every 215s."), false);
+
+
 								return 1;
 							}))
 			);
