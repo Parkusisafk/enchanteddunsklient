@@ -1,5 +1,7 @@
 package dunsklient.modid;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
+
+import java.util.Scanner;
 import java.util.concurrent.atomic.AtomicInteger;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import java.util.regex.Pattern;
@@ -9,6 +11,8 @@ import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallba
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.screen.DisconnectedScreen;
+import net.minecraft.client.gui.screen.TitleScreen;
 import net.minecraft.command.CommandSource;
 import net.minecraft.command.argument.IdentifierArgumentType;
 import net.minecraft.entity.EntityType;
@@ -47,7 +51,9 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 	private long lastGGSentTime = 0;
 	private static final long GG_COOLDOWN_MS = 60000;
 
-	// NEW: For the 10-second reset
+	private static int numtimes_cannot_find_mob = 0;
+	private static int timeelapsed_since_animal = 0;
+
 	private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 	private ScheduledFuture<?> resetTask = null;
 
@@ -59,7 +65,7 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 		ROTATING,
 		MOVING,
 		ATTACKING,
-		WAITING_FOR_DEATH
+		COOKED, WAITING_FOR_DEATH
 	}
 
 	@Override
@@ -170,6 +176,35 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 						if (resetTask != null) resetTask.cancel(false);
 					}
 				}
+			} else if((cleanContent != null && cleanContent.toLowerCase().contains("enter the captcha")) ||
+					(cleanContent != null && cleanContent.toLowerCase().contains("are you here")) ||
+					(cleanContent != null && cleanContent.toLowerCase().contains("afk check")) ||
+					(cleanContent != null && cleanContent.toLowerCase().contains("macro check"))){
+				MinecraftClient client = MinecraftClient.getInstance();
+
+				// 1. Alert the player in-game immediately
+				client.player.sendMessage(Text.of("§c§lCAPTCHA DETECTED! §7Disconnecting in 10s..."), false);
+
+				scheduler.schedule(() -> {
+					client.execute(() -> {
+						if (client.world != null) {
+							// 2. Properly disconnect from the server logic-side
+							client.world.disconnect();
+							client.disconnect();
+
+							// 3. Create the custom disconnect screen
+							// Constructor: DisconnectedScreen(parentScreen, title, reasonText)
+							DisconnectedScreen disconnectedScreen = new DisconnectedScreen(
+									new TitleScreen(),
+									Text.literal("§c§lBot Protection"), // The big bold title
+									Text.literal("§fLogged off automatically because a §eCaptcha §fwas detected.\n§7Safe to rejoin once you are ready. Content: " + cleanContent) // The sub-text
+							);
+
+							// 4. Show the screen
+							client.setScreen(disconnectedScreen);
+						}
+					});
+				}, 5, TimeUnit.SECONDS);
 			}
 		});
 
@@ -179,6 +214,7 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 
 	private void stopAutoBot(MinecraftClient client) {
 		this.isActive = false;
+
 		this.currentTarget = null;
 		this.currentState = BotState.IDLE;
 		this.dropEnabled = false;
@@ -197,6 +233,7 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 			this.isActive = true;
 			this.currentState = BotState.SCANNING;
 			client.player.sendMessage(Text.of("§aAuto-Bot activated for: " + id), false);
+			numtimes_cannot_find_mob = 0;
 		} else {
 			client.player.sendMessage(Text.of("§cInvalid mob type: " + id), false);
 			stopAutoBot(client);
@@ -235,12 +272,31 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 				checkTargetStatus(client);
 				break;
 			case IDLE:
+				whereIsAnimal(client);
 				break;
+			case COOKED:
+				break;
+
+
 		}
 	}
 
 	// --- Logic Implementation ---
 
+
+	private void whereIsAnimal(MinecraftClient client){
+		timeelapsed_since_animal++;
+		if(numtimes_cannot_find_mob > 3){
+			//something wrong alr
+			this.currentState = BotState.COOKED;
+			this.isActive = false;
+		}
+		if(timeelapsed_since_animal > 200){
+			timeelapsed_since_animal = 0;
+			this.isActive = true;
+			this.currentState = BotState.SCANNING;
+		}
+	}
 	private void scanForTarget(MinecraftClient client) {
 		Box searchBox = client.player.getBoundingBox().expand(30);
 
@@ -254,10 +310,12 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 			this.currentTarget = closest.get();
 			this.currentState = BotState.ROTATING;
 			client.player.sendMessage(Text.of("§7Target found. Engaging."), true);
+			numtimes_cannot_find_mob = 0;
 		} else {
-			client.player.sendMessage(Text.of("§eNo mob found within 30 blocks."), false);
-			this.isActive = false; // Stop the bot
+			client.player.sendMessage(Text.of("§eNo mob found within 30 blocks. Retrying..."), false);
+			//this.isActive = false; // Stop the bot
 			this.currentState = BotState.IDLE;
+			numtimes_cannot_find_mob++;
 		}
 	}
 
@@ -323,7 +381,7 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 	private void checkTargetStatus(MinecraftClient client) {
 		// If target is dead or removed, scan again
 		tickelapsed_kill++;
-		if (currentTarget == null || !currentTarget.isAlive() || currentTarget.isRemoved() || tickelapsed_kill >= 6000) {
+		if (currentTarget == null || !currentTarget.isAlive() || currentTarget.isRemoved() || tickelapsed_kill >= 3000) {
 			tickelapsed_kill = 0;
 			currentState = BotState.SCANNING;
 		}
