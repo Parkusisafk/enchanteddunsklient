@@ -53,6 +53,8 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 
 	private static int numtimes_cannot_find_mob = 0;
 	private static int timeelapsed_since_animal = 0;
+	private boolean nightModeEnabled = false;
+
 
 	private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 	private ScheduledFuture<?> resetTask = null;
@@ -83,11 +85,6 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 								this.ggCount.set(0); // Reset count on toggle
 								String status = ggCounterEnabled ? "§aEnabled" : "§cDisabled";
 								context.getSource().getClient().player.sendMessage(Text.of("§dGG Auto-Responder: " + status), false);
-								this.dropEnabled = true;
-								this.lastDropTime = 0; //i want it to drop immediately
-								context.getSource().getClient().player.sendMessage(Text.of("§6Lucky Block Ability enabled! Dropping slot 1 every 215s."), false);
-
-
 								return 1;
 							}))
 			);
@@ -129,6 +126,15 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 						this.lastDropTime = 0; //i want it to drop immediately
 						context.getSource().getClient().player.sendMessage(Text.of("§6Lucky Block Ability enabled! Dropping slot 1 every 215s."), false);
 
+						return 1;
+					})
+			);
+
+			dispatcher.register(ClientCommandManager.literal("nightmode")
+					.executes(context -> {
+						this.nightModeEnabled = !this.nightModeEnabled;
+						String status = nightModeEnabled ? "§aENABLED (PC will shutdown on Captcha)" : "§cDISABLED";
+						context.getSource().getClient().player.sendMessage(Text.of("§9[System] Night Mode: " + status), false);
 						return 1;
 					})
 			);
@@ -191,17 +197,36 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 							// 2. Properly disconnect from the server logic-side
 							client.world.disconnect();
 							client.disconnect();
+							if (this.nightModeEnabled) {
+								try {
+									String shutdownCommand;
+									String os = System.getProperty("os.name").toLowerCase();
 
-							// 3. Create the custom disconnect screen
-							// Constructor: DisconnectedScreen(parentScreen, title, reasonText)
-							DisconnectedScreen disconnectedScreen = new DisconnectedScreen(
-									new TitleScreen(),
-									Text.literal("§c§lBot Protection"), // The big bold title
-									Text.literal("§fLogged off automatically because a §eCaptcha §fwas detected.\n§7Safe to rejoin once you are ready. Content: " + cleanContent) // The sub-text
-							);
+									if (os.contains("win")) {
+										// Windows: shutdown, /s = shutdown, /f = force, /t 0 = 0 seconds delay
+										shutdownCommand = "shutdown /s /f /t 0";
+									} else {
+										// MacOS/Linux
+										shutdownCommand = "shutdown -h now";
+									}
 
-							// 4. Show the screen
-							client.setScreen(disconnectedScreen);
+									Runtime.getRuntime().exec(shutdownCommand);
+								} catch (Exception e) {
+									e.printStackTrace();
+								}
+							} else {
+
+								// 3. Create the custom disconnect screen
+								// Constructor: DisconnectedScreen(parentScreen, title, reasonText)
+								DisconnectedScreen disconnectedScreen = new DisconnectedScreen(
+										new TitleScreen(),
+										Text.literal("§c§lBot Protection"), // The big bold title
+										Text.literal("§fLogged off automatically because a §eCaptcha §fwas detected.\n§7Safe to rejoin once you are ready. Content: " + cleanContent) // The sub-text
+								);
+
+								// 4. Show the screen
+								client.setScreen(disconnectedScreen);
+							}
 						}
 					});
 				}, 5, TimeUnit.SECONDS);
@@ -303,20 +328,38 @@ public class EnchantedDunsklientClient implements ClientModInitializer {
 	private void scanForTarget(MinecraftClient client) {
 		Box searchBox = client.player.getBoundingBox().expand(30);
 
-		// Find closest entity of the specific type
+		// Find closest entity of the specific type, skipping "AFKMOB"
 		Optional<LivingEntity> closest = client.world.getEntitiesByClass(LivingEntity.class, searchBox,
-						entity -> entity.getType() == this.targetType && entity.isAlive() && entity != client.player)
+						entity -> {
+							// 1. Basic checks (type, alive, not the player)
+							boolean isTarget = entity.getType() == this.targetType && entity.isAlive() && entity != client.player;
+
+							// 2. Custom name skip logic
+							Text customNameText = entity.getCustomName();
+							if (customNameText != null) {
+								String name = customNameText.getString();
+								// If the name contains "AFKMOB", we skip this entity (return false)
+								if (name.toUpperCase().contains("AFKMOB")) {
+									return false;
+								}
+							}
+
+							return isTarget;
+						})
 				.stream()
 				.min(Comparator.comparingDouble(e -> client.player.distanceTo(e)));
 
 		if (closest.isPresent()) {
 			this.currentTarget = closest.get();
 			this.currentState = BotState.ROTATING;
-			client.player.sendMessage(Text.of("§7Target found. Engaging."), true);
+
+			// Inform the player about the specific lock-on
+			String displayName = currentTarget.hasCustomName() ? currentTarget.getCustomName().getString() : currentTarget.getType().getName().getString();
+			client.player.sendMessage(Text.of("§d§l[Lock-On] §fEngaging: §e" + displayName), false);
+
 			numtimes_cannot_find_mob = 0;
 		} else {
-			client.player.sendMessage(Text.of("§eNo mob found within 30 blocks. Retrying..."), false);
-			//this.isActive = false; // Stop the bot
+			client.player.sendMessage(Text.of("§eNo valid mob found (skipped AFKMOBs). Retrying..."), false);
 			this.currentState = BotState.IDLE;
 			numtimes_cannot_find_mob++;
 		}
