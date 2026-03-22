@@ -3,7 +3,9 @@
 	"package": "dunsklient.modid.mixin.client",
 	"compatibilityLevel": "JAVA_21",
 	"client": [
-		"ExampleClientMixin"
+		"ParticleManagerMixin",
+		"MethodFinderMixin",
+		"PacketSnifferMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

@@ -1,0 +1,444 @@
+package dunsklient.modid;
+
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.screen.DisconnectedScreen;
+import net.minecraft.client.gui.screen.TitleScreen;
+import net.minecraft.command.CommandSource;
+import net.minecraft.command.argument.IdentifierArgumentType;
+import net.minecraft.entity.EntityType;
+import net.minecraft.entity.LivingEntity;
+import net.minecraft.registry.Registries;
+import net.minecraft.text.Text;
+import net.minecraft.util.Formatting;
+import net.minecraft.util.Identifier;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.Vec3d;
+
+import java.util.Comparator;
+import java.util.Optional;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
+
+public class EnchantedDunsklientClientOld implements ClientModInitializer {
+
+	// --- State Variables ---
+	private boolean isActive = false;
+	private EntityType<?> targetType = null;
+	private LivingEntity currentTarget = null;
+	private BotState currentState = BotState.IDLE;
+
+	private boolean dropEnabled = false;
+	private long lastDropTime = 0;
+	private static final long DROP_INTERVAL_MS = 215000; // 215 seconds in milliseconds
+	private int tickelapsed_kill = 0;
+
+	private boolean ggCounterEnabled = false;
+	private final AtomicInteger ggCount = new AtomicInteger(0);
+	private static final int GG_THRESHOLD = 10;
+	private long lastGGSentTime = 0;
+	private static final long GG_COOLDOWN_MS = 60000;
+
+	private static int numtimes_cannot_find_mob = 0;
+	private static int timeelapsed_since_animal = 0;
+	private boolean nightModeEnabled = false;
+
+
+	private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+	private ScheduledFuture<?> resetTask = null;
+
+	// Pattern that ONLY looks for "GG" and ignores everything else (including symbols)
+	private static final Pattern GG_STRICT_PATTERN = Pattern.compile("GG", Pattern.CASE_INSENSITIVE);
+	private enum BotState {
+		IDLE,
+		SCANNING,
+		ROTATING,
+		MOVING,
+		ATTACKING,
+		COOKED, WAITING_FOR_DEATH
+	}
+
+	@Override
+	public void onInitializeClient() {
+		ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
+			// --- The /auto command ---
+			dispatcher.register(ClientCommandManager.literal("auto")
+					.then(ClientCommandManager.argument("mobtype", IdentifierArgumentType.identifier()) // Use the built-in type!
+							.suggests((context, builder) -> CommandSource.suggestIdentifiers(Registries.ENTITY_TYPE.getIds(), builder))
+							.executes(context -> {
+								// Use getIdentifier instead of getString
+								Identifier id = IdentifierArgumentType.getIdentifier((com.mojang.brigadier.context.CommandContext) context, "mobtype");								startAutoBot(id, context.getSource().getClient());
+
+								this.ggCounterEnabled = !this.ggCounterEnabled;
+								this.ggCount.set(0); // Reset count on toggle
+								String status = ggCounterEnabled ? "§aEnabled" : "§cDisabled";
+								context.getSource().getClient().player.sendMessage(Text.of("§dGG Auto-Responder: " + status), false);
+								return 1;
+							}))
+			);
+
+			// --- The /autostop command ---
+			dispatcher.register(ClientCommandManager.literal("autostop")
+					.executes(context -> {
+						stopAutoBot(context.getSource().getClient());
+						return 1;
+					})
+			);
+
+			dispatcher.register(ClientCommandManager.literal("luckyblockability")
+					.executes(context -> {
+						this.dropEnabled = true;
+						this.lastDropTime = 0; //i want it to drop immediately
+						context.getSource().getClient().player.sendMessage(Text.of("§6Lucky Block Ability enabled! Dropping slot 1 every 215s."), false);
+						return 1;
+					})
+			);
+
+			dispatcher.register(ClientCommandManager.literal("ggtoggle")
+					.executes(context -> {
+						this.ggCounterEnabled = !this.ggCounterEnabled;
+						this.ggCount.set(0); // Reset count on toggle
+						String status = ggCounterEnabled ? "§aEnabled" : "§cDisabled";
+						context.getSource().getClient().player.sendMessage(Text.of("§dGG Auto-Responder: " + status), false);
+						return 1;
+					})
+			);
+
+			dispatcher.register(ClientCommandManager.literal("everything")
+					.executes(context -> {
+						this.ggCounterEnabled = !this.ggCounterEnabled;
+						this.ggCount.set(0); // Reset count on toggle
+						String status = ggCounterEnabled ? "§aEnabled" : "§cDisabled";
+						context.getSource().getClient().player.sendMessage(Text.of("§dGG Auto-Responder: " + status), false);
+						this.dropEnabled = true;
+						this.lastDropTime = 0; //i want it to drop immediately
+						context.getSource().getClient().player.sendMessage(Text.of("§6Lucky Block Ability enabled! Dropping slot 1 every 215s."), false);
+
+						return 1;
+					})
+			);
+
+			dispatcher.register(ClientCommandManager.literal("nightmode")
+					.executes(context -> {
+						this.nightModeEnabled = !this.nightModeEnabled;
+						String status = nightModeEnabled ? "§aENABLED (PC will shutdown on Captcha)" : "§cDISABLED";
+						context.getSource().getClient().player.sendMessage(Text.of("§9[System] Night Mode: " + status), false);
+						return 1;
+					})
+			);
+		});
+
+		ClientReceiveMessageEvents.GAME.register((message, isOverlay) -> {
+			// 1. If the message is in the Action Bar (overlay), IGNORE IT.
+			// This stops the infinite loop!
+			if (isOverlay || !ggCounterEnabled) return;
+
+			String cleanContent = Formatting.strip(message.getString());
+
+			if (cleanContent != null && cleanContent.toLowerCase().contains("gg")) {
+				// Use the MinecraftClient instance to run logic
+				MinecraftClient client = MinecraftClient.getInstance();
+
+				// Ensure we don't count our own "GG" from the counter message
+				if (cleanContent.contains("[GG Counter]")) return;
+
+				int current = ggCount.incrementAndGet();
+
+				// Handle the 10-second reset timer
+				if (resetTask != null && !resetTask.isDone()) {
+					resetTask.cancel(false);
+				}
+				resetTask = scheduler.schedule(() -> {
+					if (ggCount.get() > 0) {
+						ggCount.set(0);
+						client.execute(() ->
+								client.player.sendMessage(Text.of("§8[Bot] GG count reset (10s idle)."), true)
+						);
+					}
+				}, 10, TimeUnit.SECONDS);
+
+				// Send the progress to Action Bar
+				client.player.sendMessage(Text.of("§d[GG Counter] " + current + "/" + GG_THRESHOLD), true);
+
+				// Send actual GG if threshold reached
+				if (current >= GG_THRESHOLD) {
+					long currentTime = System.currentTimeMillis();
+					if (currentTime - lastGGSentTime >= GG_COOLDOWN_MS) {
+						client.player.networkHandler.sendChatMessage("GG");
+						lastGGSentTime = currentTime;
+						ggCount.set(0);
+						if (resetTask != null) resetTask.cancel(false);
+					}
+				}
+			} else if((cleanContent != null && cleanContent.toLowerCase().contains("enter the captcha")) ||
+					(cleanContent != null && cleanContent.toLowerCase().contains("are you here")) ||
+					(cleanContent != null && cleanContent.toLowerCase().contains("afk check")) ||
+					(cleanContent != null && cleanContent.toLowerCase().contains("macro check"))){
+				MinecraftClient client = MinecraftClient.getInstance();
+
+				// 1. Alert the player in-game immediately
+				client.player.sendMessage(Text.of("§c§lCAPTCHA DETECTED! §7Disconnecting in 10s..."), false);
+
+				scheduler.schedule(() -> {
+					client.execute(() -> {
+						if (client.world != null) {
+							// 2. Properly disconnect from the server logic-side
+							client.world.disconnect();
+							client.disconnect();
+							if (this.nightModeEnabled) {
+								try {
+									String shutdownCommand;
+									String os = System.getProperty("os.name").toLowerCase();
+
+									if (os.contains("win")) {
+										// Windows: shutdown, /s = shutdown, /f = force, /t 0 = 0 seconds delay
+										shutdownCommand = "shutdown /s /f /t 0";
+									} else {
+										// MacOS/Linux
+										shutdownCommand = "shutdown -h now";
+									}
+
+									Runtime.getRuntime().exec(shutdownCommand);
+								} catch (Exception e) {
+									e.printStackTrace();
+								}
+							} else {
+
+								// 3. Create the custom disconnect screen
+								// Constructor: DisconnectedScreen(parentScreen, title, reasonText)
+								DisconnectedScreen disconnectedScreen = new DisconnectedScreen(
+										new TitleScreen(),
+										Text.literal("§c§lBot Protection"), // The big bold title
+										Text.literal("§fLogged off automatically because a §eCaptcha §fwas detected.\n§7Safe to rejoin once you are ready. Content: " + cleanContent) // The sub-text
+								);
+
+								// 4. Show the screen
+								client.setScreen(disconnectedScreen);
+							}
+						}
+					});
+				}, 5, TimeUnit.SECONDS);
+
+                stopAutoBot(client);
+
+			}
+		});
+
+
+		ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
+	}
+
+	private void stopAutoBot(MinecraftClient client) {
+		this.isActive = false;
+
+		this.currentTarget = null;
+		this.currentState = BotState.IDLE;
+		this.dropEnabled = false;
+		this.ggCounterEnabled = false;
+		this.ggCount.set(0);
+		// Release the keys so you stop moving immediately
+		if (client.player != null) {
+			client.options.forwardKey.setPressed(false);
+			client.player.sendMessage(Text.of("§cAuto-Bot deactivated."), false);
+		}
+	}
+
+	private void startAutoBot(Identifier id, MinecraftClient client) {
+		if (Registries.ENTITY_TYPE.containsId(id)) {
+			this.targetType = Registries.ENTITY_TYPE.get(id);
+			this.isActive = true;
+			this.currentState = BotState.SCANNING;
+			client.player.sendMessage(Text.of("§aAuto-Bot activated for: " + id), false);
+			numtimes_cannot_find_mob = 0;
+		} else {
+			client.player.sendMessage(Text.of("§cInvalid mob type: " + id), false);
+			stopAutoBot(client);
+		}
+	}
+
+	private void onTick(MinecraftClient client) {
+		if (dropEnabled && client.player != null) {
+			long currentTime = System.currentTimeMillis();
+			if (currentTime - lastDropTime >= DROP_INTERVAL_MS) {
+				// Drop the item in Slot 1 (index 0)
+				client.player.getInventory().selectedSlot = 0;
+				client.player.dropSelectedItem(false); // true = drops the whole stack
+
+				lastDropTime = currentTime;
+				client.player.sendMessage(Text.of("§6[LuckyBlock] Item dropped! Next drop in 215s."), true);
+			}
+		}
+
+		if (!isActive || client.player == null || client.world == null) return;
+
+		switch (currentState) {
+			case SCANNING:
+				scanForTarget(client);
+				break;
+			case ROTATING:
+				faceTarget(client);
+				break;
+			case MOVING:
+				moveToTarget(client);
+				break;
+			case ATTACKING:
+				performAttack(client);
+				break;
+			case WAITING_FOR_DEATH:
+				checkTargetStatus(client);
+				break;
+			case IDLE:
+				whereIsAnimal(client);
+				break;
+			case COOKED:
+				break;
+
+
+		}
+	}
+
+	// --- Logic Implementation ---
+
+
+	private void whereIsAnimal(MinecraftClient client){
+		timeelapsed_since_animal++;
+		if(numtimes_cannot_find_mob > 3){
+			//something wrong alr
+			this.currentState = BotState.COOKED;
+			this.isActive = false;
+		}
+		if(timeelapsed_since_animal > 200){
+			timeelapsed_since_animal = 0;
+			this.isActive = true;
+			this.currentState = BotState.SCANNING;
+		}
+	}
+	private void scanForTarget(MinecraftClient client) {
+		Box searchBox = client.player.getBoundingBox().expand(30);
+
+		// Find closest entity of the specific type, skipping "AFKMOB"
+		Optional<LivingEntity> closest = client.world.getEntitiesByClass(LivingEntity.class, searchBox,
+						entity -> {
+							// 1. Basic checks (type, alive, not the player)
+							boolean isTarget = entity.getType() == this.targetType && entity.isAlive() && entity != client.player;
+
+							// 2. Custom name skip logic
+							Text customNameText = entity.getCustomName();
+							if (customNameText != null) {
+								String name = customNameText.getString();
+								// If the name contains "AFKMOB", we skip this entity (return false)
+								if (name.toUpperCase().contains("AFKMOB")) {
+									return false;
+								}
+							}
+
+							return isTarget;
+						})
+				.stream()
+				.min(Comparator.comparingDouble(e -> client.player.distanceTo(e)));
+
+		if (closest.isPresent()) {
+			this.currentTarget = closest.get();
+			this.currentState = BotState.ROTATING;
+
+			// Inform the player about the specific lock-on
+			String displayName = currentTarget.hasCustomName() ? currentTarget.getCustomName().getString() : currentTarget.getType().getName().getString();
+			client.player.sendMessage(Text.of("§d§l[Lock-On] §fEngaging: §e" + displayName), false);
+
+			numtimes_cannot_find_mob = 0;
+		} else {
+			client.player.sendMessage(Text.of("§eNo valid mob found (skipped AFKMOBs). Retrying..."), false);
+			this.currentState = BotState.IDLE;
+			numtimes_cannot_find_mob++;
+		}
+	}
+
+	private void faceTarget(MinecraftClient client) {
+		if (currentTarget == null || !currentTarget.isAlive()) {
+			currentState = BotState.SCANNING;
+			return;
+		}
+
+		// Calculate angles
+		Vec3d targetPos = currentTarget.getPos().add(0, currentTarget.getHeight() / 2, 0);
+		Vec3d playerPos = client.player.getEyePos();
+		Vec3d diff = targetPos.subtract(playerPos);
+
+		double requiredYaw = Math.toDegrees(Math.atan2(diff.z, diff.x)) - 90;
+		double requiredPitch = Math.toDegrees(-Math.atan2(diff.y, Math.sqrt(diff.x * diff.x + diff.z * diff.z)));
+
+		// Smooth rotation logic (Simple Linear Interpolation)
+		float speed = 15.0f; // Rotation speed
+		client.player.setYaw(updateAngle(client.player.getYaw(), (float) requiredYaw, speed));
+		client.player.setPitch(updateAngle(client.player.getPitch(), (float) requiredPitch, speed));
+
+		// Check if we are looking roughly at the target (within 5 degrees)
+		float yawDiff = MathHelper.abs(MathHelper.wrapDegrees(client.player.getYaw() - (float)requiredYaw));
+		if (yawDiff < 5.0f) {
+			currentState = BotState.MOVING;
+		}
+	}
+
+	private void moveToTarget(MinecraftClient client) {
+		if (currentTarget == null || !currentTarget.isAlive()) {
+			client.options.forwardKey.setPressed(false);
+			currentState = BotState.SCANNING;
+			return;
+		}
+
+		// Keep facing target while moving
+		faceTarget(client);
+
+		double distance = client.player.distanceTo(currentTarget);
+		if (distance > 2.5) { // Stop slightly before 1 block to account for reach/lag
+			client.options.forwardKey.setPressed(true);
+			if (client.player.horizontalCollision && client.player.isOnGround()) {
+				client.player.jump(); // Auto jump if stuck
+			}
+		} else {
+			client.options.forwardKey.setPressed(false);
+			currentState = BotState.ATTACKING;
+		}
+	}
+
+	private void performAttack(MinecraftClient client) {
+		// Select Slot 1 (Index 0)
+		client.player.getInventory().selectedSlot = 0;
+
+		// Attack
+		client.interactionManager.attackEntity(client.player, currentTarget);
+		client.player.swingHand(client.player.getActiveHand());
+
+		currentState = BotState.WAITING_FOR_DEATH;
+	}
+
+	private void checkTargetStatus(MinecraftClient client) {
+		// If target is dead or removed, scan again
+		tickelapsed_kill++;
+		if (currentTarget == null || !currentTarget.isAlive() || currentTarget.isRemoved() || tickelapsed_kill >= 1200) {
+			tickelapsed_kill = 0;
+			currentState = BotState.SCANNING;
+		}
+		// Note: If you want to attack AGAIN because it didn't die in one hit,
+		// you would check `if (currentTarget.isAlive())` here and switch back to ATTACKING
+		// possibly with a cooldown check.
+		// Currently this waits until it dies (manual kill or bleed out) or despawns.
+	}
+
+	// Helper for smooth rotation wrapping
+	private float updateAngle(float oldAngle, float newAngle, float limit) {
+		float f = MathHelper.wrapDegrees(newAngle - oldAngle);
+		if (f > limit) f = limit;
+		if (f < -limit) f = -limit;
+		return oldAngle + f;
+	}
+}
